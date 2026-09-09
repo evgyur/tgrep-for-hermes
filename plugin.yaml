@@ -1,7 +1,7 @@
 manifest_version: 2
 api_version: 1
 name: tgrep-code-search
-version: 0.2.0
+version: 0.2.1
 description: Optional profile-scoped tgrep backend for Hermes search_files.
 author: Hermes Agent
 license: MIT

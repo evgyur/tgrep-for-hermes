@@ -145,24 +145,73 @@ def test_broad_result_volume_and_invalid_output_fall_back(root, monkeypatch):
     assert b.search(request(root)).route_reason == "incompatible_output"
 
 
-def _tcp_row(address, port, inode):
-    return f"  0: {address}:{port:04X} 00000000:0000 0A 00000000:00000000 00:00000000 00000000 0 0 {inode}\n"
-
-
-def test_linux_listener_requires_pid_ownership_and_ipv4_ipv6_loopback(tmp_path):
+def test_linux_listener_requires_pid_ownership_and_ipv4_ipv6_loopback(tmp_path, monkeypatch):
     proc = tmp_path / "proc"
     (proc / "net").mkdir(parents=True)
     (proc / "123" / "fd").mkdir(parents=True)
     os.symlink("socket:[77]", proc / "123" / "fd" / "4")
-    (proc / "net" / "tcp").write_text("header\n" + _tcp_row("0100007F", 4321, "77"))
-    (proc / "net" / "tcp6").write_text("header\n")
+    rows = [("127.0.0.1", 4321, "77")]
+    monkeypatch.setattr(mod, "_tcp_listeners", lambda: rows)
     assert mod._linux_loopback_listener(123, 4321, proc)
 
-    (proc / "net" / "tcp6").write_text(
-        "header\n" + _tcp_row("00000000000000000000000000000000", 4321, "77")
-    )
+    rows.append(("::", 4321, "77"))
+    assert not mod._linux_loopback_listener(123, 4321, proc)
+    rows[:] = [("127.0.0.1", 4321, "88")]
     assert not mod._linux_loopback_listener(123, 4321, proc)
 
-    (proc / "net" / "tcp6").write_text("header\n")
-    (proc / "net" / "tcp").write_text("header\n" + _tcp_row("0100007F", 4321, "88"))
-    assert not mod._linux_loopback_listener(123, 4321, proc)
+
+def test_live_listener_validation_without_hostwide_proc_tables(monkeypatch):
+    import socket
+    original = Path.read_text
+
+    def no_tcp_tables(path, *args, **kwargs):
+        if str(path) in {"/proc/net/tcp", "/proc/net/tcp6"}:
+            raise OSError("host-wide TCP table reads are unavailable")
+        return original(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", no_tcp_tables)
+    with socket.socket() as listener:
+        listener.bind(("127.0.0.1", 0))
+        listener.listen()
+        port = listener.getsockname()[1]
+        assert mod._linux_loopback_listener(os.getpid(), port)
+        assert not mod._linux_loopback_listener(2147483647, port)
+    assert not mod._linux_loopback_listener(os.getpid(), port)
+
+
+def test_live_listener_rejects_wildcard_bind():
+    import socket
+    with socket.socket() as listener:
+        listener.bind(("0.0.0.0", 0))
+        listener.listen()
+        assert not mod._linux_loopback_listener(os.getpid(), listener.getsockname()[1])
+
+
+@pytest.mark.parametrize("fault", ["interrupted", "truncated", "wrong_peer", "error", "short", "timeout"])
+def test_incomplete_kernel_dump_never_proves_listener_ownership(monkeypatch, fault):
+    import socket
+    import struct
+
+    class BrokenDump:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            pass
+
+        def settimeout(self, value):
+            pass
+
+        def sendto(self, *args):
+            pass
+
+        def recvmsg(self, size):
+            if fault == "timeout":
+                raise TimeoutError()
+            packet = struct.pack("=IHHIIi", 20, 2 if fault == "error" else 3, 0x10 if fault == "interrupted" else 0, 1, 0, -1 if fault == "error" else 0)
+            return (b"short" if fault == "short" else packet, [], socket.MSG_TRUNC if fault == "truncated" else 0, (123 if fault == "wrong_peer" else 0, 0))
+
+    monkeypatch.setattr(mod.socket, "socket", lambda *a: BrokenDump())
+    with pytest.raises((ValueError, OSError)):
+        mod._tcp_listeners()
+    assert not mod._linux_loopback_listener(os.getpid(), 54321)

@@ -8,6 +8,8 @@ import os
 import re
 import selectors
 import signal
+import socket
+import struct
 import subprocess
 import time
 from collections.abc import Iterable
@@ -83,31 +85,65 @@ def _canonical_git_root(path: Path) -> Path | None:
     return root if root == candidate else None
 
 
+def _tcp_listeners() -> list[tuple[str, int, str]]:
+    """Fresh, bounded Linux SOCK_DIAG dump; no host-wide /proc TCP scan.
+
+    Wire layouts are Linux UAPI inet_diag_req_v2 / inet_diag_msg. Request
+    LISTEN only, without optional attributes. Reject incomplete/error dumps.
+    """
+    listeners = []
+    deadline = time.monotonic() + 1.0
+    remaining_bytes = 1024 * 1024
+    for family in (socket.AF_INET, socket.AF_INET6):
+        with socket.socket(socket.AF_NETLINK, socket.SOCK_RAW, 4) as diag:
+            diag.settimeout(max(0.001, deadline - time.monotonic()))
+            request = struct.pack("=BBBBI", family, socket.IPPROTO_TCP, 0, 0, 1 << 10)
+            request += bytes(40) + b"\xff" * 8  # sockid, INET_DIAG_NOCOOKIE
+            diag.sendto(struct.pack("=IHHII", 16 + len(request), 20, 0x301, 1, 0) + request, (0, 0))
+            done = False
+            while not done:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0 or remaining_bytes <= 0:
+                    raise ValueError("SOCK_DIAG budget exhausted")
+                diag.settimeout(remaining)
+                packet, _, recv_flags, peer = diag.recvmsg(65536)
+                remaining_bytes -= len(packet)
+                if peer[0] != 0 or recv_flags & socket.MSG_TRUNC or not packet or remaining_bytes < 0:
+                    raise ValueError("Incomplete SOCK_DIAG datagram")
+                pos = 0
+                while pos < len(packet):
+                    if len(packet) - pos < 16:
+                        raise ValueError("Short SOCK_DIAG header")
+                    length, kind, flags, sequence, _ = struct.unpack_from("=IHHII", packet, pos)
+                    if length < 16 or pos + length > len(packet) or sequence != 1 or flags & 0x10:
+                        raise ValueError("Invalid or interrupted SOCK_DIAG dump")
+                    body = packet[pos + 16:pos + length]
+                    if kind == 3:  # NLMSG_DONE
+                        if body and (len(body) < 4 or struct.unpack_from("=i", body)[0]):
+                            raise ValueError("SOCK_DIAG completion error")
+                        done = True
+                    elif kind == 20 and len(body) >= 72 and body[0] == family and body[1] == 10:
+                        address = socket.inet_ntop(family, body[8:12] if family == socket.AF_INET else body[8:24])
+                        listeners.append((address, struct.unpack_from("!H", body, 4)[0], str(struct.unpack_from("=I", body, 68)[0])))
+                    else:
+                        raise ValueError("Unexpected SOCK_DIAG response")
+                    pos += (length + 3) & ~3
+    return listeners
+
+
 def _linux_loopback_listener(pid: int, port: int, proc_root: Path = Path("/proc")) -> bool:
     """Bind every TCP listener for ``port`` to ``pid`` and a loopback address."""
     try:
-        owned = {
-            target[8:-1]
-            for fd in (proc_root / str(pid) / "fd").iterdir()
-            if (target := os.readlink(fd)).startswith("socket:[") and target.endswith("]")
-        }
-        wanted = f"{port:04X}"
-        listeners: list[tuple[str, str]] = []
-        for name, allowed in (
-            ("tcp", {"0100007F"}),
-            ("tcp6", {"00000000000000000000000001000000"}),
-        ):
-            table = proc_root / "net" / name
-            if not table.exists():
+        owned = set()
+        for fd in (proc_root / str(pid) / "fd").iterdir():
+            try:
+                target = os.readlink(fd)
+            except FileNotFoundError:  # descriptor closed after enumeration
                 continue
-            for line in table.read_text(encoding="ascii").splitlines()[1:]:
-                fields = line.split()
-                if len(fields) >= 10 and fields[3] == "0A" and fields[1].endswith(":" + wanted):
-                    address = fields[1].split(":", 1)[0]
-                    if address not in allowed:
-                        return False
-                    listeners.append((address, fields[9]))
-        return bool(listeners) and all(inode in owned for _, inode in listeners)
+            if target.startswith("socket:[") and target.endswith("]"):
+                owned.add(target[8:-1])
+        listeners = [(address, inode) for address, number, inode in _tcp_listeners() if number == port]
+        return bool(listeners) and all(address in {"127.0.0.1", "::1"} and inode in owned for address, inode in listeners)
     except (OSError, ValueError):
         return False
 

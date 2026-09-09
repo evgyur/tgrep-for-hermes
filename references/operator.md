@@ -16,7 +16,7 @@ Settings live under `plugins.entries.tgrep-code-search.settings` in the active p
 - `min_literal_length` (default `8`): lower bound for indexed literal routing.
 - `max_limit` (default `100`): larger requested pages stay native.
 - `broad_match_threshold` (default `200`): tgrep aborts and falls back when initial volume is broad.
-- `freshness_quarantine_seconds` (default `2.0`): guaranteed native interval after a successful write/patch/terminal call.
+- `freshness_quarantine_seconds` (default `3.0`): guaranteed native interval after a write/patch/terminal call.
 - `command_timeout_seconds` (default `5.0`): status and search deadline.
 
 The plugin supports only local content searches, context `0`, output modes `content`/`files_only`, plain literals, and a conservative single positive glob. Everything else declines to native search.
@@ -57,12 +57,14 @@ Before every indexed query the plugin checks:
 
 1. local environment and supported query semantics;
 2. exact canonical root equals an allowlisted Git top-level;
-3. profile-local `root.json` exactly matches root and index;
-4. tgrep status succeeds with watcher active, indexing complete, reconciliation idle/pending no/overdue no, and a successful reconciliation timestamp;
-5. status PID is alive and its port is listening only on loopback;
+3. profile-local `root.json` matches the canonical root; the index path is derived from the active profile's plugin storage;
+4. tgrep status succeeds with watcher active, indexing complete and reconciliation idle, without pending/overdue/error diagnostics;
+5. a fresh bounded Linux `SOCK_DIAG` dump proves that every listener for the status port is loopback-only and its inode belongs to the status PID;
 6. no freshness barrier is active.
 
 A status diagnostic or any stderr from the search is degraded evidence and triggers rg fallback. This includes tgrep v1.0.5's misleading `Server unreachable` prefix on invalid regex; regex never reaches tgrep through this router.
+
+The listener check has no cache, shell command, or external `ss` dependency. It requests only TCP listeners for IPv4 and IPv6, rejects interrupted/truncated/error responses, and bounds the dump to one second and 1 MiB. Kernel diagnostics unavailable under a sandbox means native fallback, not bypassed validation.
 
 ## Routing reasons
 

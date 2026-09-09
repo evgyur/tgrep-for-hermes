@@ -34,7 +34,7 @@ Indexes cost 96.2/189.1 MB; build time was 1.61/3.90 s; larger-corpus server RSS
 
 - Hermes revision exposing `PluginContext.register_search_backend`.
 - Microsoft tgrep installed separately; this repository does not vendor binaries.
-- Linux for the current loopback `/proc` listener verification.
+- Linux with `NETLINK_SOCK_DIAG` and readable process descriptor metadata for loopback/ownership verification. Verification is fresh on every search; unavailable or incomplete kernel diagnostics fall back to rg.
 - `systemd --user` for the supplied lifecycle owner.
 
 ## Install per profile
@@ -54,7 +54,7 @@ plugins:
         min_literal_length: 8
         max_limit: 100
         broad_match_threshold: 200
-        freshness_quarantine_seconds: 2.0
+        freshness_quarantine_seconds: 3.0
         command_timeout_seconds: 5.0
 ```
 
