@@ -1,0 +1,22 @@
+#!/usr/bin/env python3
+from pathlib import Path
+import subprocess, tempfile
+
+validator = Path(__file__).with_name("validate.py")
+subprocess.run(["python3", str(validator)], check=True)
+source = validator.read_text(encoding="utf-8")
+with tempfile.TemporaryDirectory() as td:
+    root = Path(td)
+    (root / "scripts").mkdir()
+    (root / "references").mkdir()
+    original = validator.resolve().parents[1]
+    text = (original / "SKILL.md").read_text(encoding="utf-8").replace("Do not modify Hermes core", "")
+    (root / "SKILL.md").write_text(text, encoding="utf-8")
+    (root / "references" / "operator.md").write_text("fixture", encoding="utf-8")
+    candidate = source.replace("Path(__file__).resolve().parents[1]", "Path(" + repr(str(root)) + ")")
+    probe = root / "scripts" / "validate.py"
+    probe.write_text(candidate, encoding="utf-8")
+    p = subprocess.run(["python3", str(probe)], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if p.returncode == 0:
+        raise SystemExit("negative contract test unexpectedly passed")
+print("tgrep-for-hermes negative contract: ok")
