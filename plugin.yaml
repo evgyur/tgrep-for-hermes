@@ -1,0 +1,18 @@
+manifest_version: 2
+api_version: 1
+name: tgrep-code-search
+version: 0.2.0
+description: Optional profile-scoped tgrep backend for Hermes search_files.
+author: Hermes Agent
+license: MIT
+homepage: https://github.com/evgyur/tgrep-for-hermes
+tags: [code-search, tgrep, ripgrep, indexing]
+config_schema:
+  enabled: {type: bool, default: false, description: Enable the optional tgrep search backend.}
+  binary: {type: str, default: "~/.local/bin/tgrep", description: Absolute or home-relative tgrep binary path.}
+  repo_roots: {type: list, default: [], description: Exact canonical Git repository roots eligible for indexing.}
+  min_literal_length: {type: int, default: 8, description: Minimum plain-literal length eligible for tgrep.}
+  max_limit: {type: int, default: 100, description: Maximum requested result limit eligible for tgrep.}
+  broad_match_threshold: {type: int, default: 200, description: Fall back to rg when tgrep produces more rows.}
+  freshness_quarantine_seconds: {type: float, default: 3.0, description: Native-search window after a successful write-capable tool call.}
+  command_timeout_seconds: {type: float, default: 5.0, description: Maximum tgrep client/status runtime.}
