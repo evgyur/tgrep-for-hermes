@@ -1,63 +1,82 @@
 # tgrep for Hermes
 
-A small Hermes skill for deciding **when indexed code search is actually worth it**.
+An optional, profile-scoped [Microsoft tgrep](https://github.com/microsoft/tgrep) backend for Hermes `search_files`, plus its operating skill.
 
-It treats [Microsoft tgrep](https://github.com/microsoft/tgrep) as a specialized path for repeated selective searches in larger repositories—not as a blanket replacement for Hermes `search_files` or ripgrep.
+The plugin is deliberately hybrid. Selective literal/symbol queries can use the indexed tgrep server; everything broad, regex-based, unsupported, freshness-sensitive, unhealthy, or ambiguous stays on Hermes' native ripgrep path.
 
-## Measured results
+## Safety architecture
 
-Ubuntu Linux x86_64, `tgrep` v1.0.5, warm client/server searches. Every row used the same corpus and query for ripgrep and tgrep; normalized output and exit codes matched.
+- The plugin registers through Hermes' generic `register_search_backend` seam; it does **not** override `search_files`.
+- Hermes retains path validation, blocked-path filtering, redaction, pagination output shaping, and native fallback.
+- tgrep is optional. Missing plugin, binary, index, or server leaves rg working.
+- Only explicitly configured exact Git top-levels are eligible.
+- Every profile has separate settings, indexes, metadata, server instance, and mutation barrier.
+- Indexes live under profile-owned plugin data, never in a repository.
+- tgrep v1.0.5 binds its server to `127.0.0.1:0`; the plugin independently verifies the listening socket is loopback.
+
+## Measured baseline
+
+Ubuntu Linux x86_64, tgrep v1.0.5, warm client/server searches. Normalized output and exit codes matched.
 
 | Corpus / query | ripgrep median / p95 | tgrep median / p95 | Outcome |
 |---|---:|---:|---:|
 | 6,120 files — selective literal | 27.1 / 28.6 ms | 11.2 / 12.9 ms | 2.42× faster |
 | 6,120 files — second selective literal | 26.3 / 27.9 ms | 7.7 / 8.6 ms | 3.40× faster |
-| 6,120 files — realistic regex | 27.3 / 29.0 ms | 43.7 / 46.5 ms | tgrep slower |
-| 6,120 files — broad, 51,982 lines | 35.4 / 38.2 ms | 842.8 / 882.3 ms | tgrep ~24× slower |
+| 6,120 files — realistic regex | 27.3 / 29.0 ms | 43.7 / 46.5 ms | rg retained |
+| 6,120 files — broad, 51,982 lines | 35.4 / 38.2 ms | 842.8 / 882.3 ms | rg retained |
 | 14,374 files — selective literal | 52.8 / 55.4 ms | 11.8 / 13.4 ms | 4.48× faster |
 | 14,374 files — no match | 52.0 / 55.2 ms | 4.0 / 4.7 ms | 13.09× faster |
-| 14,374 files — realistic regex | 52.9 / 55.2 ms | 49.4 / 63.3 ms | near tie |
-| 14,374 files — broad, 84,097 lines | 90.3 / 117.5 ms | 1,512.6 / 1,688.3 ms | tgrep ~16.7× slower |
+| 14,374 files — broad, 84,097 lines | 90.3 / 117.5 ms | 1,512.6 / 1,688.3 ms | rg retained |
 
-### Resource cost
+Indexes cost 96.2/189.1 MB; build time was 1.61/3.90 s; larger-corpus server RSS was about 187 MB. Watcher create/modify/delete and 12 concurrent queries passed in the original evaluation.
 
-| Corpus | Index build | Index size | Peak/server memory |
-|---|---:|---:|---:|
-| 6,120 files | 1.61 s | 96.2 MB | ~111 MB build peak RSS |
-| 14,374 files | 3.90 s | 189.1 MB | ~187 MB server RSS |
+## Requirements
 
-The watcher passed create → modify → delete freshness checks, and 12 concurrent selective searches returned identical successful output.
+- Hermes revision exposing `PluginContext.register_search_backend`.
+- Microsoft tgrep installed separately; this repository does not vendor binaries.
+- Linux with `NETLINK_SOCK_DIAG` and readable process descriptor metadata for loopback/ownership verification. Verification is fresh on every search; unavailable or incomplete kernel diagnostics fall back to rg.
+- `systemd --user` for the supplied lifecycle owner.
 
-## Verdict
+## Install per profile
 
-Use tgrep when all of these are true:
+Place an immutable checkout/copy in each selected profile's `plugins/tgrep-code-search` directory, then enable `tgrep-code-search` in that profile and configure its settings. No `tools.override` grant is required.
 
-- the repository is large enough that selective ripgrep scans are material;
-- the workload performs repeated symbol or fixed-string searches;
-- the measured absolute saving is useful (the skill defaults to 25 ms);
-- index disk and server memory fit the host budget.
-
-Keep ripgrep/Hermes native search for broad queries, immediate post-write truth, and modes that bypass or weaken indexed semantics.
-
-## Install the skill
-
-```bash
-git clone https://github.com/evgyur/tgrep-for-hermes.git ~/.hermes/skills/tgrep-for-hermes
-python3 ~/.hermes/skills/tgrep-for-hermes/scripts/validate.py
+```yaml
+plugins:
+  enabled: [tgrep-code-search]
+  entries:
+    tgrep-code-search:
+      settings:
+        enabled: true
+        binary: ~/.local/bin/tgrep
+        repo_roots:
+          - /absolute/exact/git/root
+        min_literal_length: 8
+        max_limit: 100
+        broad_match_threshold: 200
+        freshness_quarantine_seconds: 3.0
+        command_timeout_seconds: 5.0
 ```
 
-Install `tgrep` separately from its [official upstream](https://github.com/microsoft/tgrep). This repository does not vendor binaries.
+Prepare and start one profile-owned server:
+
+```bash
+python3 scripts/tgrep_lifecycle.py start \
+  --profile default \
+  --hermes-home ~/.hermes \
+  --root /absolute/exact/git/root
+```
+
+Run the equivalent command with the named profile's own `HERMES_HOME`; never reuse the default index path.
 
 ## Contents
 
-- `SKILL.md` — trigger, routing policy, safety boundaries, and done criteria.
-- `references/operator.md` — commands, benchmark gate, integration caveats.
-- `scripts/validate.py` — deterministic contract validation.
-- `scripts/test_contract.py` — positive plus negative contract test.
-
-## Important limitation
-
-Installing a skill changes agent procedure; it does **not** replace or accelerate Hermes `search_files`. A future native/plugin integration needs separate path confinement, flag allowlisting, fallback, and end-to-end benchmarks.
+- `plugin.yaml`, `__init__.py`, `tgrep_backend.py` — native backend plugin.
+- `SKILL.md` — routing and operating contract.
+- `references/operator.md` — lifecycle, fallback, diagnostics, metrics, rollback.
+- `scripts/tgrep_lifecycle.py` — exact-root index and profile service manager.
+- `scripts/validate.py`, `scripts/test_contract.py` — deterministic packaging checks.
+- `tests/` — router, lifecycle, safety, and public hygiene tests.
 
 ## License
 

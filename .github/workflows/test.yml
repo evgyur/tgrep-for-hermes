@@ -15,7 +15,9 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      - run: python3 -m pip install pytest
       - run: python3 scripts/validate.py
       - run: python3 scripts/test_contract.py
+      - run: python3 -m pytest -q tests/test_tgrep_backend.py tests/test_lifecycle.py tests/test_plugin_entrypoint.py
       - run: python3 tests/test_public_hygiene.py
       - run: python3 tests/test_shell_syntax.py

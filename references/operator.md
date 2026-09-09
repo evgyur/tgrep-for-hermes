@@ -1,54 +1,113 @@
 # tgrep operator reference
 
-## Tested artifact
+## Artifact and compatibility
 
-The initial Hermes evaluation pinned Microsoft `tgrep` v1.0.5 for Linux x86_64 musl and verified the release-provided SHA-256 before installing the binary. Re-check the current official GitHub release and checksum before every upgrade; do not treat this historical pin as an update instruction.
+Pin and verify the official Microsoft tgrep artifact before installation. The HEL1 qualification used Linux x86_64 tgrep v1.0.5 with SHA-256 `1ef4125ab256586cd8008bfb4704bcaf12a40d24372d2c5ad548d22923432cf3`.
 
-Canonical upstream: <https://github.com/microsoft/tgrep>
+The plugin requires a Hermes core that exposes the generic profile-scoped `PluginContext.register_search_backend` seam. On an older core the plugin must fail to register without altering built-in `search_files`; rg remains available.
 
-## Commands
+## Profile settings
 
-Use an index outside the repository:
+Settings live under `plugins.entries.tgrep-code-search.settings` in the active profile's `config.yaml`.
 
-```bash
-TGREP="$HOME/.local/bin/tgrep"
-ROOT="/absolute/repository"
-IDX="$HOME/.cache/tgrep/indexes/<repo-key>"
+- `enabled` (default `false`): master router switch.
+- `binary` (default `~/.local/bin/tgrep`): executable path.
+- `repo_roots` (default `[]`): explicit exact canonical Git top-level allowlist.
+- `min_literal_length` (default `8`): lower bound for indexed literal routing.
+- `max_limit` (default `100`): larger requested pages stay native.
+- `broad_match_threshold` (default `200`): tgrep aborts and falls back when initial volume is broad.
+- `freshness_quarantine_seconds` (default `3.0`): guaranteed native interval after a write/patch/terminal call.
+- `command_timeout_seconds` (default `5.0`): status and search deadline.
 
-"$TGREP" index "$ROOT" --index-path "$IDX"
-"$TGREP" serve "$ROOT" --index-path "$IDX"
-"$TGREP" status "$ROOT" --index-path "$IDX"
-"$TGREP" --index-path "$IDX" -F -- "ExactSymbol" "$ROOT"
-"$TGREP" --index-path "$IDX" --no-index -F -- "ExactSymbol" "$ROOT"
+The plugin supports only local content searches, context `0`, output modes `content`/`files_only`, plain literals, and a conservative single positive glob. Everything else declines to native search.
+
+## Index and service lifecycle
+
+Indexes resolve to:
+
+```text
+<HERMES_HOME>/plugin-data/tgrep-code-search/indexes/<sha256(canonical-root)[:24]>/
 ```
 
-Keep all flags before `--`; place the pattern and explicit root after it. `index`, `serve`, `status`, `count-files`, `search`, and `help` are subcommand-like tokens, so `--` prevents a pattern from being misparsed.
+The lifecycle script refuses a subdirectory, non-Git directory, missing binary, or malformed profile name.
 
-## Benchmark acceptance
+```bash
+python3 scripts/tgrep_lifecycle.py prepare \
+  --profile default --hermes-home ~/.hermes \
+  --root /absolute/exact/git/root
 
-Use at least 15 warm repetitions per query after one untimed warm-up. Record median and p95 wall latency. Compare sorted line output and exit codes with ripgrep. A practical promotion gate is:
+python3 scripts/tgrep_lifecycle.py start \
+  --profile default --hermes-home ~/.hermes \
+  --root /absolute/exact/git/root
 
-- at least 2x on representative selective queries;
-- at least 25 ms median absolute savings per agent search;
-- output and exit-code parity across the fixed corpus;
-- freshness canary passes;
-- server RSS and index disk fit the host budget;
-- broad queries retain native fallback.
+python3 scripts/tgrep_lifecycle.py status \
+  --profile default --hermes-home ~/.hermes \
+  --root /absolute/exact/git/root
 
-Adjust the absolute threshold only with observed end-to-end agent latency evidence.
+python3 scripts/tgrep_lifecycle.py stop --profile default
+```
 
-## Known caveats
+`start` installs a user-level `hermes-tgrep@.service`, writes a profile-specific environment file, and enables only the named instance. `stop` leaves indexes and user data intact.
 
-- Linux gives smaller gains than macOS/Windows because warm ripgrep scans are already fast.
-- High-match-volume queries may be much slower due to indexed server serialization and delivery.
-- `--hidden`, unrestricted/no-ignore, binary/text/encoding modes, `--no-index`, and single-file paths may bypass the index.
-- `-L`, `--one-file-system`, and `--ignore-file` only affect full scans; do not assume indexed searches honor them.
-- On-disk-only indexes do not update after edits.
-- Watcher updates are asynchronous. Native mode can miss events until reconciliation; polling has bounded cadence rather than immediate freshness.
-- A server on an existing index may report indexing complete while startup reconciliation/watch registration is still in progress.
-- Invalid regex currently returns exit `2`, but v1.0.5 can prepend a misleading `Server unreachable, falling back to local index` warning even when the server remains healthy. Preserve stderr and classify this as degraded diagnostics, not a server crash.
-- `--json` mostly matches ripgrep, but invalid UTF-8 line bytes are replacement text rather than ripgrep-style base64.
+Run separate instances for `default` and `hermesdev`; their env files and index paths must differ even when the indexed root is the same.
 
-## Hermes integration boundary
+## Eligibility and health
 
-A user-local skill changes agent procedure, not the implementation of Hermes `search_files`. Do not claim tgrep accelerates that built-in tool unless a separately reviewed integration routes it explicitly. Prefer a least-privilege plugin/tool wrapper over core edits if future end-to-end evidence justifies integration: canonicalize the root, allowlist flags, keep loopback-only serving, return stdout+stderr+exit code, and preserve native fallback.
+Before every indexed query the plugin checks:
+
+1. local environment and supported query semantics;
+2. exact canonical root equals an allowlisted Git top-level;
+3. profile-local `root.json` matches the canonical root; the index path is derived from the active profile's plugin storage;
+4. tgrep status succeeds with watcher active, indexing complete and reconciliation idle, without pending/overdue/error diagnostics;
+5. a fresh bounded Linux `SOCK_DIAG` dump proves that every listener for the status port is loopback-only and its inode belongs to the status PID;
+6. no freshness barrier is active.
+
+A status diagnostic or any stderr from the search is degraded evidence and triggers rg fallback. This includes tgrep v1.0.5's misleading `Server unreachable` prefix on invalid regex; regex never reaches tgrep through this router.
+
+The listener check has no cache, shell command, or external `ss` dependency. It requests only TCP listeners for IPv4 and IPv6, rejects interrupted/truncated/error responses, and bounds the dump to one second and 1 MiB. Kernel diagnostics unavailable under a sandbox means native fallback, not bypassed validation.
+
+## Routing reasons
+
+Successful indexed responses expose:
+
+```text
+backend: tgrep
+route_reason: eligible_selective_literal
+```
+
+Native fallback exposes `backend: rg` (or `grep`) and one reason such as:
+
+- `disabled`, `remote_environment`, `regex_query`, `short_literal`;
+- `unsupported_context`, `unsupported_output_mode`, `unsupported_glob`, `high_limit`;
+- `unindexed_repo_root`, `missing_binary`, `missing_index_metadata`, `index_metadata_mismatch`;
+- `post_write_freshness`, `unhealthy_server`, `non_loopback_server`;
+- `tgrep_timeout`, `tgrep_diagnostic`, `tgrep_error`, `broad_result_volume`, `incompatible_output`;
+- `backend_error:tgrep` or `backend_invalid:tgrep` from the core safety seam.
+
+## Freshness
+
+Watcher readiness does not guarantee immediate post-write visibility. The `post_tool_call` hook marks all configured roots stale after successful `write_file`, `patch`, or `terminal` execution. Searches during the bounded quarantine use rg. This is deliberately conservative for terminal commands whose mutation surface cannot be proven from the command string.
+
+Create/modify/delete tests must assert the first subsequent search uses rg and sees the current filesystem. After the barrier, require a fresh status receipt before allowing tgrep again.
+
+## Metrics and acceptance
+
+Use at least 15 warm repetitions after one warm-up. Record median and p95 for the same query/corpus and compare sorted paths, line numbers, text, and exit semantics with rg.
+
+Promotion gate:
+
+- at least 2× on representative selective queries;
+- at least 25 ms median absolute saving unless a different bound is justified by measured agent latency;
+- parity for selective and no-match cases;
+- broad, regex, unsupported, missing, unhealthy, diagnostic, and immediate-write cases visibly route to rg;
+- 12 concurrent indexed queries pass;
+- index disk and server RSS fit the host budget;
+- listener is loopback-only and no `.tgrep`/index exists inside the repo.
+
+## Rollback and cleanup
+
+1. Set plugin `settings.enabled: false` or remove the plugin from that profile's enabled list.
+2. Restart/reload through the existing Hermes runtime owner if required to unload plugin registration.
+3. Stop only `hermes-tgrep@<profile>.service` for the affected profile.
+4. Verify `search_files` returns native rg results and gateway health is unchanged.
+5. Preserve indexes and user/shared data unless deletion is separately authorized.
